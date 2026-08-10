@@ -192,11 +192,18 @@ def make_pipeline(feature_columns: list[str]) -> Pipeline:
 
 def print_metrics(name: str, y_true: pd.Series, pred: np.ndarray) -> None:
     pred = np.clip(pred, 1e-6, 1 - 1e-6)
+    brier = brier_score_loss(y_true, pred)
+    mean_control_rate = float(y_true.mean())
+    mean_control_brier = mean_control_rate * (1 - mean_control_rate)
+    competition_score = max(0, 100000 * (1 - brier / mean_control_brier))
     print(
         f"{name}: "
         f"auc={roc_auc_score(y_true, pred):.6f} "
         f"logloss={log_loss(y_true, pred):.6f} "
-        f"brier={brier_score_loss(y_true, pred):.6f} "
+        f"brier={brier:.6f} "
+        f"bss_score={competition_score:.6f} "
+        f"mean_control_rate={mean_control_rate:.6f} "
+        f"mean_control_brier={mean_control_brier:.6f} "
         f"ap={average_precision_score(y_true, pred):.6f} "
         f"mean_pred={pred.mean():.6f}"
     )
