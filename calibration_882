@@ -1,0 +1,245 @@
+import sklearn
+import numpy
+import pandas as pd
+import joblib
+import os
+
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import brier_score_loss
+from catboost import CatBoostClassifier
+
+EPS = 1e-15
+
+
+def safe_logit(proba):
+    proba = numpy.clip(proba, EPS, 1 - EPS)
+    return numpy.log(proba / (1 - proba))
+
+
+def sigmoid(logit):
+    return 1 / (1 + numpy.exp(-logit))
+
+
+def apply_temperature_scaling(proba, temperature):
+    return sigmoid(safe_logit(proba) / temperature)
+
+
+def binary_log_loss(y_true, proba):
+    proba = numpy.clip(proba, EPS, 1 - EPS)
+    return -numpy.mean(
+        y_true * numpy.log(proba) + (1 - y_true) * numpy.log(1 - proba)
+    )
+
+
+def fit_temperature(proba, y_true):
+    # Temperature는 양수 하나만 찾으면 되므로 scipy 없이 촘촘한 grid search로 안정적으로 탐색한다.
+    coarse_temperatures = numpy.logspace(numpy.log10(0.05), numpy.log10(10.0), 200)
+    coarse_losses = [
+        binary_log_loss(y_true, apply_temperature_scaling(proba, temperature))
+        for temperature in coarse_temperatures
+    ]
+    best_idx = int(numpy.argmin(coarse_losses))
+
+    left_idx = max(0, best_idx - 1)
+    right_idx = min(len(coarse_temperatures) - 1, best_idx + 1)
+    fine_temperatures = numpy.linspace(
+        coarse_temperatures[left_idx],
+        coarse_temperatures[right_idx],
+        200
+    )
+    fine_losses = [
+        binary_log_loss(y_true, apply_temperature_scaling(proba, temperature))
+        for temperature in fine_temperatures
+    ]
+
+    return float(fine_temperatures[int(numpy.argmin(fine_losses))])
+
+
+train = pd.read_csv("train.csv")
+
+print(train.shape)
+print(train.head())
+
+# 데이터 불러오기
+df = train.copy()
+
+drop_cols = [
+    "control_success",
+    "row_id",
+    "pitcher_id",
+    "batter_id"
+]
+
+# target 분리
+X = df.drop(columns=drop_cols)
+y = df["control_success"]
+
+
+# 1. 범주형 컬럼 먼저 정의
+categorical_cols = [
+    "top_bottom",
+    "game_type",
+    "base_state",
+    "game_dayofweek",
+    "pitcher_hand",
+    "batter_hand",
+    "pitcher_team_id",
+    "batter_team_id"
+]
+
+# 2. 나머지는 numeric
+numeric_cols = [
+    col for col in X.columns
+    if col not in categorical_cols
+]
+
+
+# 숫자형 전처리
+numeric_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+# 범주형 전처리
+categorical_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+# 전처리 통합
+preprocessor = ColumnTransformer([
+    ("num", numeric_transformer, numeric_cols),
+    ("cat", categorical_transformer, categorical_cols)
+])
+
+# CatBoost
+model = Pipeline([
+    ("preprocessor", preprocessor),
+    ("model", CatBoostClassifier(
+        iterations=1000,
+        learning_rate=0.05,
+        depth=6,
+        loss_function="Logloss",
+        eval_metric="BrierScore",
+        random_seed=42,
+        verbose=100
+    ))
+])
+
+# pitcher_id를 그룹으로 사용
+groups = df["pitcher_id"]
+
+# 80% train / 20% validation을 여러 번 반복
+N_SPLITS = 5
+gss = GroupShuffleSplit(
+    n_splits=N_SPLITS,
+    test_size=0.2,
+    random_state=40
+)
+
+scores = []
+briers = []
+calibrated_scores = []
+calibrated_briers = []
+calibration_pred_probas = []
+calibration_targets = []
+
+for split_idx, (train_idx, valid_idx) in enumerate(
+    gss.split(X, y, groups=groups),
+    start=1
+):
+    X_train = X.iloc[train_idx]
+    X_valid = X.iloc[valid_idx]
+
+    y_train = y.iloc[train_idx]
+    y_valid = y.iloc[valid_idx]
+
+    # 확인
+    train_pitchers = set(groups.iloc[train_idx])
+    valid_pitchers = set(groups.iloc[valid_idx])
+
+    print(f"\n===== Split {split_idx}/{N_SPLITS} =====")
+    print("Train shape:", X_train.shape)
+    print("Valid shape:", X_valid.shape)
+    print("Train pitchers:", len(train_pitchers))
+    print("Valid pitchers:", len(valid_pitchers))
+    print("겹치는 투수 수:", len(train_pitchers & valid_pitchers))
+
+    eval_model = clone(model)
+    eval_model.fit(X_train, y_train)
+
+    pred_proba = eval_model.predict_proba(X_valid)[:, 1]
+    split_temperature = fit_temperature(pred_proba, y_valid.to_numpy())
+    calibrated_pred_proba = apply_temperature_scaling(pred_proba, split_temperature)
+
+    brier = brier_score_loss(y_valid, pred_proba)
+    calibrated_brier = brier_score_loss(y_valid, calibrated_pred_proba)
+
+    r = y_valid.mean()
+    baseline_brier = r * (1 - r)
+
+    score = max(
+        0,
+        100000 * (1 - brier / baseline_brier)
+    )
+
+    calibrated_score = max(
+        0,
+        100000 * (1 - calibrated_brier / baseline_brier)
+    )
+
+    calibration_pred_probas.append(pred_proba)
+    calibration_targets.append(y_valid.to_numpy())
+
+    briers.append(brier)
+    scores.append(score)
+    calibrated_briers.append(calibrated_brier)
+    calibrated_scores.append(calibrated_score)
+
+    print(f"Raw Brier Score: {brier:.6f}")
+    print(f"Temperature: {split_temperature:.6f}")
+    print(f"Calibrated Brier Score: {calibrated_brier:.6f}")
+    print(f"Validation 평균 제구율 r: {r:.6f}")
+    print(f"Raw 예상 대회 Score: {score:.2f}")
+    print(f"Calibrated 예상 대회 Score: {calibrated_score:.2f}")
+
+print("\n===== Cross Validation Summary =====")
+print(f"Raw 평균 Brier Score: {numpy.mean(briers):.6f}")
+print(f"Raw Brier Score 표준편차: {numpy.std(briers):.6f}")
+print(f"Raw 평균 예상 대회 Score: {numpy.mean(scores):.2f}")
+print(f"Raw 예상 대회 Score 표준편차: {numpy.std(scores):.2f}")
+print(f"Calibrated 평균 Brier Score: {numpy.mean(calibrated_briers):.6f}")
+print(f"Calibrated Brier Score 표준편차: {numpy.std(calibrated_briers):.6f}")
+print(f"Calibrated 평균 예상 대회 Score: {numpy.mean(calibrated_scores):.2f}")
+print(f"Calibrated 예상 대회 Score 표준편차: {numpy.std(calibrated_scores):.2f}")
+
+final_temperature = fit_temperature(
+    numpy.concatenate(calibration_pred_probas),
+    numpy.concatenate(calibration_targets)
+)
+print(f"\nValidation 예측 기반 최종 Temperature: {final_temperature:.6f}")
+
+os.makedirs("submit/model", exist_ok=True)
+
+model.fit(X, y) # 제출용 split 없이 전체 학습 ==================================================================
+
+model_path = "submit/model/catboost_pipeline.joblib"
+temperature_path = "submit/model/temperature.joblib"
+
+joblib.dump(
+    model,
+    model_path
+)
+
+joblib.dump(
+    final_temperature,
+    temperature_path
+)
+
+print(f"모델 저장 완료: {model_path}")
+print(f"Temperature 저장 완료: {temperature_path}")
