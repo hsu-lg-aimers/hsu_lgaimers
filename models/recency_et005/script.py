@@ -10,60 +10,6 @@ ID_COL = "row_id"
 TARGET_COL = "control_success"
 MODEL_FILENAME = "model.pkl"
 MAX_EXTRATREES_WEIGHT = 0.05
-META_MAX_ABS_DELTA = 0.060
-META_DEFAULT_STRENGTH = 0.35
-META_CAT_COLS = [
-    "top_bottom",
-    "game_type",
-    "base_state",
-    "count_state",
-    "hand_matchup",
-    "pitcher_exp_bin",
-    "batter_exp_bin",
-    "pressure_bin",
-]
-META_NUM_COLS = [
-    "balls_before",
-    "strikes_before",
-    "outs_before",
-    "inning",
-    "li",
-    "num_runners_on",
-    "runner_on_1b",
-    "runner_on_2b",
-    "runner_on_3b",
-    "score_diff_pitcher_team",
-    "score_diff_home",
-    "home_win_expectancy",
-    "away_win_expectancy",
-    "asof_pitcher_n",
-    "asof_batter_n",
-    "asof_pitcher_pitchmix_n",
-    "asof_pitcher_success_rate",
-    "asof_batter_success_rate",
-    "asof_pitcher_ball_rate",
-    "asof_pitcher_strike_rate",
-    "asof_pitcher_fastball_rate",
-    "asof_pitcher_breaking_rate",
-    "asof_pitcher_offspeed_rate",
-    "pitcher_recent5_success_delta",
-    "pitcher_recent3_success_delta",
-    "pitcher_recent1_success_delta",
-    "pitcher_ball_minus_strike_rate",
-    "batter_success_minus_pitcher_success",
-    "fastball_minus_breaking_rate",
-    "offspeed_share_of_nonfastball",
-    "tm_state_n",
-    "tm_state_rel_speed_mean",
-    "tm_state_spin_rate_mean",
-    "tm_state_induced_vert_break_mean",
-    "tm_state_horz_break_mean",
-    "tm_state_extension_mean",
-    "tm_state_zone_speed_mean",
-    "tm_state_fastball_rate_smooth_500",
-    "tm_state_breaking_rate_smooth_500",
-    "tm_state_offspeed_rate_smooth_500",
-]
 
 RATE_SPECS = [
     ("asof_pitcher_n", "asof_pitcher_success_rate", "pitcher_success"),
@@ -184,21 +130,6 @@ def build_features(
     x["log_pitcher_n"] = np.log1p(x["asof_pitcher_n"].clip(lower=0))
     x["log_batter_n"] = np.log1p(x["asof_batter_n"].clip(lower=0))
     x["log_pitchmix_n"] = np.log1p(x["asof_pitcher_pitchmix_n"].clip(lower=0))
-    x["pitcher_exp_bin"] = pd.cut(
-        pd.to_numeric(x["asof_pitcher_n"], errors="coerce").fillna(0),
-        bins=[-1, 10, 50, 150, 400, np.inf],
-        labels=["p_000_010", "p_011_050", "p_051_150", "p_151_400", "p_401_plus"],
-    ).astype(str)
-    x["batter_exp_bin"] = pd.cut(
-        pd.to_numeric(x["asof_batter_n"], errors="coerce").fillna(0),
-        bins=[-1, 10, 50, 150, 400, np.inf],
-        labels=["b_000_010", "b_011_050", "b_051_150", "b_151_400", "b_401_plus"],
-    ).astype(str)
-    x["pressure_bin"] = pd.cut(
-        pd.to_numeric(x["pressure"], errors="coerce").fillna(0),
-        bins=[-np.inf, 0.8, 1.5, 3.0, np.inf],
-        labels=["low", "mid", "high", "extreme"],
-    ).astype(str)
 
     for n_col, rate_col, prefix in RATE_SPECS:
         prior = rate_priors.get(rate_col, rate_priors.get(TARGET_COL, 0.5))
@@ -345,63 +276,6 @@ def apply_calibration(pred: np.ndarray, calibration: dict[str, float]) -> np.nda
     return sigmoid(calibration["scale"] * logit(pred) + calibration["bias"])
 
 
-def make_meta_frame(
-    x: pd.DataFrame,
-    lgbm_pred: np.ndarray,
-    cat_pred: np.ndarray,
-    et_pred: np.ndarray,
-    raw_pred: np.ndarray,
-    calibrated_pred: np.ndarray,
-) -> pd.DataFrame:
-    meta = pd.DataFrame(index=x.index)
-    meta["meta_lgbm_pred"] = lgbm_pred
-    meta["meta_catboost_pred"] = cat_pred
-    meta["meta_extratrees_pred"] = et_pred
-    meta["meta_raw_pred"] = raw_pred
-    meta["meta_calibrated_pred"] = calibrated_pred
-    meta["meta_lgbm_logit"] = logit(lgbm_pred)
-    meta["meta_catboost_logit"] = logit(cat_pred)
-    meta["meta_extratrees_logit"] = logit(et_pred)
-    meta["meta_raw_logit"] = logit(raw_pred)
-    meta["meta_calibrated_logit"] = logit(calibrated_pred)
-    meta["meta_cat_minus_lgbm"] = cat_pred - lgbm_pred
-    meta["meta_et_minus_cat"] = et_pred - cat_pred
-    meta["meta_model_spread"] = np.maximum.reduce([lgbm_pred, cat_pred, et_pred]) - np.minimum.reduce(
-        [lgbm_pred, cat_pred, et_pred]
-    )
-
-    for col in META_CAT_COLS:
-        if col in x.columns:
-            meta[col] = x[col].astype(object).where(pd.notna(x[col]), "__MISSING__").astype(str)
-    for col in META_NUM_COLS:
-        if col in x.columns:
-            meta[col] = pd.to_numeric(x[col], errors="coerce")
-    return meta
-
-
-def apply_meta_residual_corrector(
-    x: pd.DataFrame,
-    lgbm_pred: np.ndarray,
-    cat_pred: np.ndarray,
-    et_pred: np.ndarray,
-    raw_pred: np.ndarray,
-    calibrated_pred: np.ndarray,
-    corrector: dict[str, object] | None,
-) -> np.ndarray:
-    if not corrector or not corrector.get("enabled"):
-        return calibrated_pred
-    meta_x = make_meta_frame(x, lgbm_pred, cat_pred, et_pred, raw_pred, calibrated_pred)
-    feature_columns = corrector.get("feature_columns", list(meta_x.columns))
-    for col in feature_columns:
-        if col not in meta_x.columns:
-            meta_x[col] = np.nan
-    meta_x = meta_x.loc[:, feature_columns]
-    max_abs_delta = float(corrector.get("max_abs_delta", META_MAX_ABS_DELTA))
-    strength = float(corrector.get("strength", META_DEFAULT_STRENGTH))
-    delta = np.clip(corrector["model"].predict(meta_x), -max_abs_delta, max_abs_delta)
-    return np.clip(calibrated_pred + strength * delta, 1e-6, 1 - 1e-6)
-
-
 def main() -> None:
     test_path, sample_path, model_path, output_path = resolve_paths()
 
@@ -422,7 +296,6 @@ def main() -> None:
             "extratrees": 0.0,
         }
     calibration = artifact.get("calibration", {"scale": 1.0, "bias": 0.0})
-    postprocess = artifact.get("postprocess", {})
 
     print(f"Load test: {test_path}")
     test = load_test(test_path)
@@ -445,16 +318,7 @@ def main() -> None:
         else:
             et_pred = np.zeros_like(lgbm_pred)
         preds = blend_predictions_3way(lgbm_pred, cat_pred, et_pred, blend_weights)
-        calibrated = apply_calibration(preds, calibration)
-        preds = apply_meta_residual_corrector(
-            x_test,
-            lgbm_pred,
-            cat_pred,
-            et_pred,
-            preds,
-            calibrated,
-            postprocess.get("meta_residual"),
-        )
+        preds = apply_calibration(preds, calibration)
     else:
         preds = np.array([])
     print(f"preds={len(preds)}")

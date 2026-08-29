@@ -15,6 +15,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
+from sklearn.ensemble import ExtraTreesClassifier
 
 
 ID_COL = "row_id"
@@ -51,17 +52,6 @@ TRACKMAN_GROUP_COLS = [
     "strikes_before",
     "outs_before",
 ]
-RICH_TRACKMAN_GROUP_COLS = [
-    "game_month",
-    "game_dayofweek",
-    "inning",
-    "top_bottom",
-    "balls_before",
-    "strikes_before",
-    "outs_before",
-    "pitcher_hand",
-    "batter_hand",
-]
 TRACKMAN_NUMERIC_COLS = [
     "rel_speed",
     "spin_rate",
@@ -75,10 +65,42 @@ TRACKMAN_NUMERIC_COLS = [
 PITCH_GROUPS = ["fastball", "breaking", "offspeed", "other"]
 HAND_MAP = {"Left": 1, "Right": 2}
 TRACKMAN_RATE_SMOOTHING_STRENGTHS = [100, 500, 1500]
+MAX_EXTRATREES_WEIGHT = 0.05
+SEASON_WEIGHT_PROFILES = {
+    "none": {},
+    "recency": {
+        2019: 0.35,
+        2020: 0.45,
+        2021: 0.60,
+        2022: 0.80,
+        2023: 0.85,
+        2024: 1.20,
+    },
+    "aggressive_2024": {
+        2019: 0.25,
+        2020: 0.35,
+        2021: 0.45,
+        2022: 0.70,
+        2023: 0.55,
+        2024: 1.40,
+    },
+}
+DEFAULT_SEASON_WEIGHT_PROFILE = "recency"
+DEFAULT_TRACKMAN_RECENT_LAMBDA = 0.50
 
 
 def find_repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    script_dir = Path(__file__).resolve().parent
+    candidates = [script_dir, Path.cwd(), *script_dir.parents, *Path.cwd().parents]
+    seen = set()
+    for base in candidates:
+        key = str(base)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (base / "data" / "train.csv").exists():
+            return base
+    return Path.cwd()
 
 
 def default_train_path() -> Path:
@@ -102,27 +124,15 @@ def load_train(path: Path) -> pd.DataFrame:
 
 
 def load_trackman(path: Path) -> pd.DataFrame:
-    usecols = [
-        "season",
-        *TRACKMAN_GROUP_COLS,
-        *RICH_TRACKMAN_GROUP_COLS,
-        *TRACKMAN_NUMERIC_COLS,
-        "pitch_type_group",
-    ]
-    usecols = list(dict.fromkeys(usecols))
+    usecols = ["season"] + TRACKMAN_GROUP_COLS + TRACKMAN_NUMERIC_COLS + ["pitch_type_group"]
     df = pd.read_csv(path, usecols=usecols, encoding="utf-8-sig")
     df["pitcher_hand"] = df["pitcher_hand"].map(HAND_MAP)
     df["batter_hand"] = df["batter_hand"].map(HAND_MAP)
-    df["top_bottom"] = df["top_bottom"].map({"Top": "T", "Bottom": "B"}).fillna(df["top_bottom"])
     return df.dropna(subset=TRACKMAN_GROUP_COLS)
 
 
-def build_trackman_prior_by_cols(
-    trackman: pd.DataFrame,
-    group_cols: list[str],
-    prefix: str,
-) -> pd.DataFrame:
-    grouped = trackman.groupby(group_cols, dropna=False)
+def build_trackman_prior(trackman: pd.DataFrame) -> pd.DataFrame:
+    grouped = trackman.groupby(TRACKMAN_GROUP_COLS, dropna=False)
 
     global_pitch_rates = trackman["pitch_type_group"].value_counts(normalize=True)
     global_pitch_rates = {
@@ -137,15 +147,15 @@ def build_trackman_prior_by_cols(
     ]
     rename_map = {}
     for col in prior.columns:
-        if col not in group_cols:
-            rename_map[col] = f"{prefix}_{col}"
+        if col not in TRACKMAN_GROUP_COLS:
+            rename_map[col] = f"tm_state_{col}"
     prior = prior.rename(columns=rename_map)
 
-    counts = grouped.size().reset_index(name=f"{prefix}_n")
-    prior = prior.merge(counts, on=group_cols, how="left")
+    counts = grouped.size().reset_index(name="tm_state_n")
+    prior = prior.merge(counts, on=TRACKMAN_GROUP_COLS, how="left")
 
     pitch_counts = (
-        trackman.groupby(group_cols + ["pitch_type_group"], dropna=False)
+        trackman.groupby(TRACKMAN_GROUP_COLS + ["pitch_type_group"], dropna=False)
         .size()
         .unstack("pitch_type_group", fill_value=0)
     )
@@ -153,33 +163,73 @@ def build_trackman_prior_by_cols(
         if pitch_group not in pitch_counts.columns:
             pitch_counts[pitch_group] = 0
     pitch_rates = pitch_counts[PITCH_GROUPS].div(pitch_counts[PITCH_GROUPS].sum(axis=1), axis=0)
-    pitch_rates = pitch_rates.add_prefix(f"{prefix}_").add_suffix("_rate").reset_index()
+    pitch_rates = pitch_rates.add_prefix("tm_state_").add_suffix("_rate").reset_index()
 
-    prior = prior.merge(pitch_rates, on=group_cols, how="left")
+    prior = prior.merge(pitch_rates, on=TRACKMAN_GROUP_COLS, how="left")
     for strength in TRACKMAN_RATE_SMOOTHING_STRENGTHS:
-        prior[f"{prefix}_reliability_{strength}"] = prior[f"{prefix}_n"] / (
-            prior[f"{prefix}_n"] + strength
+        prior[f"tm_state_reliability_{strength}"] = prior["tm_state_n"] / (
+            prior["tm_state_n"] + strength
         )
         for pitch_group in PITCH_GROUPS:
-            rate_col = f"{prefix}_{pitch_group}_rate"
-            smooth_col = f"{prefix}_{pitch_group}_rate_smooth_{strength}"
+            rate_col = f"tm_state_{pitch_group}_rate"
+            smooth_col = f"tm_state_{pitch_group}_rate_smooth_{strength}"
             prior[smooth_col] = (
-                prior[f"{prefix}_n"] * prior[rate_col]
+                prior["tm_state_n"] * prior[rate_col]
                 + strength * global_pitch_rates[pitch_group]
-            ) / (prior[f"{prefix}_n"] + strength)
-    feature_cols = [col for col in prior.columns if col not in group_cols]
+            ) / (prior["tm_state_n"] + strength)
+    feature_cols = [col for col in prior.columns if col not in TRACKMAN_GROUP_COLS]
     prior[feature_cols] = prior[feature_cols].replace([np.inf, -np.inf], np.nan)
     prior.columns = pd.Index([str(col) for col in prior.columns], dtype=object)
     prior.index = pd.RangeIndex(len(prior))
     return prior
 
 
-def build_trackman_prior(trackman: pd.DataFrame) -> pd.DataFrame:
-    return build_trackman_prior_by_cols(trackman, TRACKMAN_GROUP_COLS, "tm_state")
+def build_recency_trackman_prior(
+    trackman: pd.DataFrame,
+    recent_season: int | None,
+    recent_lambda: float,
+) -> pd.DataFrame:
+    if recent_season is None or recent_lambda <= 0:
+        return build_trackman_prior(trackman)
+    if recent_lambda > 1:
+        raise ValueError("--trackman-recent-lambda must be between 0 and 1.")
 
+    all_prior = build_trackman_prior(trackman)
+    recent = trackman[trackman["season"] == recent_season].copy()
+    if recent.empty:
+        print(f"Trackman recent season {recent_season} is empty; use all-season prior.")
+        return all_prior
 
-def build_rich_trackman_prior(trackman: pd.DataFrame) -> pd.DataFrame:
-    return build_trackman_prior_by_cols(trackman, RICH_TRACKMAN_GROUP_COLS, "tm_rich")
+    recent_prior = build_trackman_prior(recent)
+    feature_cols = [col for col in all_prior.columns if col not in TRACKMAN_GROUP_COLS]
+    merged = all_prior.merge(
+        recent_prior,
+        on=TRACKMAN_GROUP_COLS,
+        how="left",
+        suffixes=("", "_recent"),
+    )
+    for col in feature_cols:
+        recent_col = f"{col}_recent"
+        if recent_col not in merged.columns:
+            continue
+        recent_values = merged[recent_col]
+        merged[col] = np.where(
+            recent_values.notna(),
+            (1 - recent_lambda) * merged[col] + recent_lambda * recent_values,
+            merged[col],
+        )
+    drop_cols = [col for col in merged.columns if col.endswith("_recent")]
+    result = merged.drop(columns=drop_cols)
+    result.columns = pd.Index([str(col) for col in result.columns], dtype=object)
+    result.index = pd.RangeIndex(len(result))
+    print(
+        "Trackman prior blend: "
+        f"all_groups={len(all_prior)} "
+        f"recent_season={recent_season} "
+        f"recent_groups={len(recent_prior)} "
+        f"lambda={recent_lambda:.3f}"
+    )
+    return result
 
 
 def serialize_trackman_prior(prior: pd.DataFrame) -> dict[str, object]:
@@ -203,17 +253,55 @@ def make_rate_priors(train: pd.DataFrame) -> dict[str, float]:
     return priors
 
 
+def season_sample_weight(df: pd.DataFrame, profile: str) -> np.ndarray | None:
+    if profile not in SEASON_WEIGHT_PROFILES:
+        raise ValueError(f"unknown season weight profile: {profile}")
+    weights = SEASON_WEIGHT_PROFILES[profile]
+    if not weights:
+        return None
+    return df["season"].map(weights).fillna(1.0).to_numpy(dtype="float64")
+
+
+def combine_sample_weight(*weights: np.ndarray | None) -> np.ndarray | None:
+    result = None
+    for weight in weights:
+        if weight is None:
+            continue
+        result = weight.astype("float64", copy=True) if result is None else result * weight
+    return result
+
+
+def apply_train_variant(
+    fit_df: pd.DataFrame,
+    variant: str,
+    season_weight_profile: str,
+) -> tuple[pd.DataFrame, np.ndarray | None]:
+    fit_df = fit_df.copy()
+    variant_weight = None
+    if variant == "drop_2023":
+        fit_df = fit_df[fit_df["season"] != 2023].copy()
+    elif variant == "weight_2023_050":
+        variant_weight = np.where(fit_df["season"].to_numpy() == 2023, 0.5, 1.0)
+    elif variant == "weight_2023_030":
+        variant_weight = np.where(fit_df["season"].to_numpy() == 2023, 0.3, 1.0)
+    elif variant == "drop_2023_f":
+        fit_df = fit_df[~((fit_df["season"] == 2023) & (fit_df["game_type"] == "F"))].copy()
+    elif variant == "drop_pre2023_f":
+        fit_df = fit_df[~((fit_df["season"] <= 2022) & (fit_df["game_type"] == "F"))].copy()
+    elif variant == "drop_through2023_f":
+        fit_df = fit_df[fit_df["game_type"] != "F"].copy()
+    elif variant != "baseline":
+        raise ValueError(f"unknown variant: {variant}")
+
+    recency_weight = season_sample_weight(fit_df, season_weight_profile)
+    sample_weight = combine_sample_weight(variant_weight, recency_weight)
+    return fit_df, sample_weight
+
+
 def smooth_rate(df: pd.DataFrame, n_col: str, rate_col: str, prior: float, strength: int) -> pd.Series:
     n = pd.to_numeric(df[n_col], errors="coerce").fillna(0).clip(lower=0)
     rate = pd.to_numeric(df[rate_col], errors="coerce").fillna(prior)
     return (n * rate + strength * prior) / (n + strength)
-
-
-def rounded_rate_count(df: pd.DataFrame, n_col: str, rate_col: str) -> pd.Series:
-    n = pd.to_numeric(df[n_col], errors="coerce")
-    rate = pd.to_numeric(df[rate_col], errors="coerce")
-    count = np.rint(n * rate)
-    return pd.Series(count, index=df.index).where(n.notna() & rate.notna())
 
 
 def safe_divide(num: pd.Series, den: pd.Series) -> pd.Series:
@@ -225,7 +313,6 @@ def build_features(
     df: pd.DataFrame,
     rate_priors: dict[str, float],
     trackman_prior: pd.DataFrame | None = None,
-    rich_trackman_prior: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     x = df.drop(columns=[ID_COL, TARGET_COL], errors="ignore").copy()
 
@@ -258,12 +345,6 @@ def build_features(
     x["log_pitchmix_n"] = np.log1p(x["asof_pitcher_pitchmix_n"].clip(lower=0))
 
     for n_col, rate_col, prefix in RATE_SPECS:
-        count = rounded_rate_count(x, n_col, rate_col)
-        n = pd.to_numeric(x[n_col], errors="coerce")
-        x[f"{prefix}_count"] = count
-        x[f"{prefix}_non_count"] = n - count
-        x[f"log_{prefix}_count"] = np.log1p(count.clip(lower=0))
-        x[f"log_{prefix}_non_count"] = np.log1p((n - count).clip(lower=0))
         prior = rate_priors.get(rate_col, rate_priors.get(TARGET_COL, 0.5))
         for strength in SMOOTHING_STRENGTHS:
             x[f"{prefix}_smooth_{strength}"] = smooth_rate(x, n_col, rate_col, prior, strength)
@@ -300,7 +381,6 @@ def build_features(
 
     if trackman_prior is not None:
         x = x.merge(trackman_prior, on=TRACKMAN_GROUP_COLS, how="left")
-        x = x.copy()
         x["fastball_minus_tm_state_fastball_rate"] = (
             x["asof_pitcher_fastball_rate"] - x["tm_state_fastball_rate"]
         )
@@ -312,46 +392,14 @@ def build_features(
         )
         x["pitcher_speed_context"] = x["asof_pitcher_fastball_rate"] * x["tm_state_rel_speed_mean"]
 
-    if rich_trackman_prior is not None:
-        x = x.merge(rich_trackman_prior, on=RICH_TRACKMAN_GROUP_COLS, how="left")
-        x = x.copy()
-        rich_weight = x["tm_rich_n"] / (x["tm_rich_n"] + 500)
-        x["tm_rich_has_match"] = x["tm_rich_n"].notna().astype("int8")
-        x["tm_rich_weight_500"] = rich_weight
-        for col in TRACKMAN_NUMERIC_COLS:
-            rich_col = f"tm_rich_{col}_mean"
-            state_col = f"tm_state_{col}_mean"
-            if rich_col in x.columns and state_col in x.columns:
-                x[f"tm_rich_minus_state_{col}"] = x[rich_col] - x[state_col]
-                x[f"tm_blend_{col}_mean_500"] = rich_weight * x[rich_col] + (1 - rich_weight) * x[state_col]
-        for pitch_group in PITCH_GROUPS:
-            rich_col = f"tm_rich_{pitch_group}_rate"
-            state_col = f"tm_state_{pitch_group}_rate"
-            if rich_col in x.columns and state_col in x.columns:
-                x[f"tm_rich_minus_state_{pitch_group}_rate"] = x[rich_col] - x[state_col]
-                x[f"tm_blend_{pitch_group}_rate_500"] = (
-                    rich_weight * x[rich_col] + (1 - rich_weight) * x[state_col]
-                )
-        x["fastball_minus_tm_blend_fastball_rate_500"] = (
-            x["asof_pitcher_fastball_rate"] - x["tm_blend_fastball_rate_500"]
-        )
-        x["breaking_minus_tm_blend_breaking_rate_500"] = (
-            x["asof_pitcher_breaking_rate"] - x["tm_blend_breaking_rate_500"]
-        )
-        x["offspeed_minus_tm_blend_offspeed_rate_500"] = (
-            x["asof_pitcher_offspeed_rate"] - x["tm_blend_offspeed_rate_500"]
-        )
-    else:
-        x["tm_rich_has_match"] = 0
-
     return x
 
 
-def make_lgbm_pipeline(feature_columns: list[str], lgbm_device: str = "cpu") -> Pipeline:
+def make_preprocessor(feature_columns: list[str]) -> ColumnTransformer:
     cat_cols = [col for col in CAT_COLS if col in feature_columns]
     num_cols = [col for col in feature_columns if col not in cat_cols]
 
-    preprocessor = ColumnTransformer(
+    return ColumnTransformer(
         transformers=[
             (
                 "cat",
@@ -367,6 +415,8 @@ def make_lgbm_pipeline(feature_columns: list[str], lgbm_device: str = "cpu") -> 
         remainder="drop",
     )
 
+
+def make_lgbm_pipeline(feature_columns: list[str], lgbm_device: str = "cpu") -> Pipeline:
     params = {
         "objective": "regression",
         "metric": "l2",
@@ -384,16 +434,9 @@ def make_lgbm_pipeline(feature_columns: list[str], lgbm_device: str = "cpu") -> 
         "verbosity": -1,
     }
     if lgbm_device == "gpu":
-        params.update(
-            {
-                "device_type": "gpu",
-                "gpu_use_dp": False,
-            }
-        )
+        params.update({"device_type": "gpu", "gpu_use_dp": False})
 
-    regressor = LGBMRegressor(**params)
-
-    return Pipeline([("pre", preprocessor), ("reg", regressor)])
+    return Pipeline([("pre", make_preprocessor(feature_columns)), ("reg", LGBMRegressor(**params))])
 
 
 def make_catboost_model(catboost_device: str = "cpu", gpu_device: str = "0") -> CatBoostClassifier:
@@ -410,13 +453,23 @@ def make_catboost_model(catboost_device: str = "cpu", gpu_device: str = "0") -> 
         "allow_writing_files": False,
     }
     if catboost_device == "gpu":
-        params.update(
-            {
-                "task_type": "GPU",
-                "devices": gpu_device,
-            }
-        )
+        params.update({"task_type": "GPU", "devices": gpu_device})
     return CatBoostClassifier(**params)
+
+
+def make_extratrees_pipeline(feature_columns: list[str]) -> Pipeline:
+    model = ExtraTreesClassifier(
+        n_estimators=350,
+        criterion="log_loss",
+        max_features=0.70,
+        min_samples_leaf=60,
+        min_samples_split=120,
+        bootstrap=False,
+        random_state=44,
+        n_jobs=-1,
+        verbose=0,
+    )
+    return Pipeline([("pre", make_preprocessor(feature_columns)), ("et", model)])
 
 
 def prepare_catboost_frame(
@@ -485,8 +538,56 @@ def fit_blend_weight(lgbm_pred: np.ndarray, cat_pred: np.ndarray, y: pd.Series) 
     return float(result.x)
 
 
+def fit_blend_weights_3way(
+    lgbm_pred: np.ndarray,
+    cat_pred: np.ndarray,
+    et_pred: np.ndarray,
+    y: pd.Series,
+) -> dict[str, float]:
+    y_values = y.to_numpy(dtype="float64")
+    pred_matrix = np.vstack([lgbm_pred, cat_pred, et_pred]).T
+
+    def objective(weights: np.ndarray) -> float:
+        pred = pred_matrix @ weights
+        return float(np.mean((pred - y_values) ** 2))
+
+    result = minimize(
+        objective,
+        x0=np.array([0.12, 0.83, 0.05]),
+        method="SLSQP",
+        bounds=[(0.0, 1.0), (0.0, 1.0), (0.0, MAX_EXTRATREES_WEIGHT)],
+        constraints=[{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}],
+        options={"maxiter": 300, "ftol": 1e-12},
+    )
+    weights = result.x if result.success else np.array([0.12, 0.83, 0.05])
+    weights = np.clip(weights, 0, 1)
+    weights[2] = min(weights[2], MAX_EXTRATREES_WEIGHT)
+    weights = weights / weights.sum()
+    return {
+        "lgbm": float(weights[0]),
+        "catboost": float(weights[1]),
+        "extratrees": float(weights[2]),
+        "success": bool(result.success),
+        "objective": float(objective(weights)),
+    }
+
+
 def blend_predictions(lgbm_pred: np.ndarray, cat_pred: np.ndarray, lgbm_weight: float) -> np.ndarray:
     return np.clip(lgbm_weight * lgbm_pred + (1 - lgbm_weight) * cat_pred, 0, 1)
+
+
+def blend_predictions_3way(
+    lgbm_pred: np.ndarray,
+    cat_pred: np.ndarray,
+    et_pred: np.ndarray,
+    weights: dict[str, float],
+) -> np.ndarray:
+    pred = (
+        weights["lgbm"] * lgbm_pred
+        + weights["catboost"] * cat_pred
+        + weights["extratrees"] * et_pred
+    )
+    return np.clip(pred, 0, 1)
 
 
 def score_dict(y_true: pd.Series, pred: np.ndarray) -> dict[str, float]:
@@ -532,6 +633,7 @@ def fit_ensemble(
 ) -> dict[str, object]:
     lgbm_model = make_lgbm_pipeline(feature_columns, lgbm_device)
     cat_model = make_catboost_model(catboost_device, gpu_device)
+    et_model = make_extratrees_pipeline(feature_columns)
 
     start = time.time()
     print(f"  LightGBM device={lgbm_device}")
@@ -547,7 +649,12 @@ def fit_ensemble(
     cat_model.fit(x_fit_cb, y_fit, cat_features=cat_columns, sample_weight=sample_weight)
     print(f"  CatBoost fit seconds={time.time() - start:.1f}")
 
-    return {"lgbm": lgbm_model, "catboost": cat_model}
+    start = time.time()
+    print("  ExtraTrees device=cpu")
+    et_model.fit(x_fit, y_fit, et__sample_weight=sample_weight)
+    print(f"  ExtraTrees fit seconds={time.time() - start:.1f}")
+
+    return {"lgbm": lgbm_model, "catboost": cat_model, "extratrees": et_model}
 
 
 def predict_ensemble_raw(
@@ -555,64 +662,59 @@ def predict_ensemble_raw(
     x: pd.DataFrame,
     feature_columns: list[str],
     cat_columns: list[str],
-    lgbm_weight: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    blend_weights: dict[str, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     lgbm_pred = np.clip(models["lgbm"].predict(x.loc[:, feature_columns]), 0, 1)
     x_cb = prepare_catboost_frame(x, feature_columns, cat_columns)
     cat_pred = models["catboost"].predict_proba(x_cb)[:, 1]
-    ensemble_pred = blend_predictions(lgbm_pred, cat_pred, lgbm_weight)
-    return lgbm_pred, cat_pred, ensemble_pred
+    et_pred = models["extratrees"].predict_proba(x.loc[:, feature_columns])[:, 1]
+    ensemble_pred = blend_predictions_3way(lgbm_pred, cat_pred, et_pred, blend_weights)
+    return lgbm_pred, cat_pred, et_pred, ensemble_pred
 
 
 def train_and_validate(
     train: pd.DataFrame,
     trackman: pd.DataFrame,
     variant: str,
+    season_weight_profile: str,
+    trackman_recent_lambda: float,
     validation_pred_path: Path | None = None,
     lgbm_device: str = "cpu",
     catboost_device: str = "cpu",
     gpu_device: str = "0",
-) -> tuple[float, dict[str, float], dict[str, dict]]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, dict]]:
     if train["season"].nunique() < 2 or 2024 not in set(train["season"]):
         print("Skip holdout validation: season 2024 is not available.")
-        return 0.5, {"scale": 1.0, "bias": 0.0, "success": True, "objective": np.nan}, {}
+        return (
+            {"lgbm": 0.12, "catboost": 0.83, "extratrees": 0.05, "success": True, "objective": np.nan},
+            {"scale": 1.0, "bias": 0.0, "success": True, "objective": np.nan},
+            {},
+        )
 
     fit_df = train[train["season"] <= 2023].copy()
     valid_df = train[train["season"] == 2024].copy()
     if fit_df.empty or valid_df.empty:
         print("Skip holdout validation: not enough rows.")
-        return 0.5, {"scale": 1.0, "bias": 0.0, "success": True, "objective": np.nan}, {}
+        return (
+            {"lgbm": 0.12, "catboost": 0.83, "extratrees": 0.05, "success": True, "objective": np.nan},
+            {"scale": 1.0, "bias": 0.0, "success": True, "objective": np.nan},
+            {},
+        )
 
-    sample_weight = None
-    if variant == "drop_2023":
-        fit_df = fit_df[fit_df["season"] != 2023].copy()
-    elif variant == "weight_2023_050":
-        sample_weight = np.where(fit_df["season"].to_numpy() == 2023, 0.5, 1.0)
-    elif variant == "weight_2023_030":
-        sample_weight = np.where(fit_df["season"].to_numpy() == 2023, 0.3, 1.0)
-    elif variant == "drop_2023_f":
-        fit_df = fit_df[~((fit_df["season"] == 2023) & (fit_df["game_type"] == "F"))].copy()
-    elif variant == "drop_pre2023_f":
-        fit_df = fit_df[~((fit_df["season"] <= 2022) & (fit_df["game_type"] == "F"))].copy()
-    elif variant == "drop_through2023_f":
-        fit_df = fit_df[fit_df["game_type"] != "F"].copy()
-    elif variant != "baseline":
-        raise ValueError(f"unknown variant: {variant}")
+    fit_df, sample_weight = apply_train_variant(fit_df, variant, season_weight_profile)
 
     rate_priors = make_rate_priors(fit_df)
-    validation_trackman = trackman[trackman["season"] <= 2023].copy()
-    validation_trackman_prior = build_trackman_prior(validation_trackman)
-    validation_rich_trackman_prior = build_rich_trackman_prior(validation_trackman)
+    validation_trackman_prior = build_recency_trackman_prior(
+        trackman[trackman["season"] <= 2023].copy(),
+        2023,
+        trackman_recent_lambda,
+    )
     print(
         f"Validation Trackman prior groups={len(validation_trackman_prior)} "
         f"features={validation_trackman_prior.shape[1] - len(TRACKMAN_GROUP_COLS)}"
     )
-    print(
-        f"Validation rich Trackman prior groups={len(validation_rich_trackman_prior)} "
-        f"features={validation_rich_trackman_prior.shape[1] - len(RICH_TRACKMAN_GROUP_COLS)}"
-    )
-    x_fit = build_features(fit_df, rate_priors, validation_trackman_prior, validation_rich_trackman_prior)
-    x_valid = build_features(valid_df, rate_priors, validation_trackman_prior, validation_rich_trackman_prior)
+    x_fit = build_features(fit_df, rate_priors, validation_trackman_prior)
+    x_valid = build_features(valid_df, rate_priors, validation_trackman_prior)
     feature_columns = list(x_fit.columns)
     cat_columns = [col for col in CAT_COLS if col in feature_columns]
 
@@ -634,8 +736,9 @@ def train_and_validate(
     lgbm_pred = np.clip(models["lgbm"].predict(x_valid.loc[:, feature_columns]), 0, 1)
     x_valid_cb = prepare_catboost_frame(x_valid, feature_columns, cat_columns)
     cat_pred = models["catboost"].predict_proba(x_valid_cb)[:, 1]
-    lgbm_weight = fit_blend_weight(lgbm_pred, cat_pred, valid_df[TARGET_COL])
-    raw_pred = blend_predictions(lgbm_pred, cat_pred, lgbm_weight)
+    et_pred = models["extratrees"].predict_proba(x_valid.loc[:, feature_columns])[:, 1]
+    blend_weights = fit_blend_weights_3way(lgbm_pred, cat_pred, et_pred, valid_df[TARGET_COL])
+    raw_pred = blend_predictions_3way(lgbm_pred, cat_pred, et_pred, blend_weights)
 
     calibration = fit_logit_brier_calibration(raw_pred, valid_df[TARGET_COL])
     calibrated_pred = apply_calibration(raw_pred, calibration)
@@ -657,6 +760,7 @@ def train_and_validate(
                 "asof_batter_n": valid_df["asof_batter_n"].to_numpy(),
                 "lgbm_pred": lgbm_pred,
                 "catboost_pred": cat_pred,
+                "extratrees_pred": et_pred,
                 "ensemble_raw": raw_pred,
                 "ensemble_calibrated": calibrated_pred,
             }
@@ -668,6 +772,7 @@ def train_and_validate(
     metrics = {
         "lgbm_raw": score_dict(valid_df[TARGET_COL], lgbm_pred),
         "catboost_raw": score_dict(valid_df[TARGET_COL], cat_pred),
+        "extratrees_raw": score_dict(valid_df[TARGET_COL], et_pred),
         "ensemble_raw": score_dict(valid_df[TARGET_COL], raw_pred),
         "ensemble_calibrated": score_dict(valid_df[TARGET_COL], calibrated_pred),
     }
@@ -675,9 +780,17 @@ def train_and_validate(
         "name": variant,
         "fit_rows": int(len(fit_df)),
         "sample_weight_used": sample_weight is not None,
+        "season_weight_profile": season_weight_profile,
+        "trackman_recent_lambda": float(trackman_recent_lambda),
     }
 
-    print(f"blend: lgbm_weight={lgbm_weight:.6f} catboost_weight={1 - lgbm_weight:.6f}")
+    print(
+        "blend: "
+        f"lgbm_weight={blend_weights['lgbm']:.6f} "
+        f"catboost_weight={blend_weights['catboost']:.6f} "
+        f"extratrees_weight={blend_weights['extratrees']:.6f} "
+        f"success={blend_weights['success']}"
+    )
     for name, score in metrics.items():
         if isinstance(score, dict) and "auc" in score:
             print_metrics(f"holdout_2024_{name}", score)
@@ -688,7 +801,7 @@ def train_and_validate(
         f"success={calibration['success']}"
     )
 
-    return lgbm_weight, calibration, metrics
+    return blend_weights, calibration, metrics
 
 
 def main() -> None:
@@ -706,6 +819,17 @@ def main() -> None:
     parser.add_argument("--gpu-device", default="0")
     parser.add_argument("--lgbm-device", choices=["cpu", "gpu"], default=None)
     parser.add_argument("--catboost-device", choices=["cpu", "gpu"], default=None)
+    parser.add_argument(
+        "--season-weight-profile",
+        choices=sorted(SEASON_WEIGHT_PROFILES),
+        default=DEFAULT_SEASON_WEIGHT_PROFILE,
+    )
+    parser.add_argument(
+        "--trackman-recent-lambda",
+        type=float,
+        default=DEFAULT_TRACKMAN_RECENT_LAMBDA,
+        help="Blend weight for the latest available Trackman season prior.",
+    )
     parser.add_argument(
         "--variant",
         choices=[
@@ -726,7 +850,13 @@ def main() -> None:
         "Training devices: "
         f"LightGBM={lgbm_device} "
         f"CatBoost={catboost_device} "
+        f"ExtraTrees=cpu "
         f"gpu_device={args.gpu_device}"
+    )
+    print(
+        "Recency settings: "
+        f"season_weight_profile={args.season_weight_profile} "
+        f"trackman_recent_lambda={args.trackman_recent_lambda:.3f}"
     )
 
     print(f"Load train: {args.train_path}")
@@ -736,25 +866,26 @@ def main() -> None:
 
     print(f"Load trackman: {args.trackman_path}")
     trackman = load_trackman(args.trackman_path)
-    final_trackman_prior = build_trackman_prior(trackman)
-    final_rich_trackman_prior = build_rich_trackman_prior(trackman)
+    final_trackman_prior = build_recency_trackman_prior(
+        trackman,
+        2024 if 2024 in set(trackman["season"]) else None,
+        args.trackman_recent_lambda,
+    )
     print(
         f"Final Trackman prior groups={len(final_trackman_prior)} "
         f"features={final_trackman_prior.shape[1] - len(TRACKMAN_GROUP_COLS)}"
     )
-    print(
-        f"Final rich Trackman prior groups={len(final_rich_trackman_prior)} "
-        f"features={final_rich_trackman_prior.shape[1] - len(RICH_TRACKMAN_GROUP_COLS)}"
-    )
 
-    lgbm_weight = 0.5
+    blend_weights = {"lgbm": 0.12, "catboost": 0.83, "extratrees": 0.05, "success": True, "objective": np.nan}
     calibration = {"scale": 1.0, "bias": 0.0, "success": True, "objective": np.nan}
     validation_metrics = {}
     if not args.skip_validation:
-        lgbm_weight, calibration, validation_metrics = train_and_validate(
+        blend_weights, calibration, validation_metrics = train_and_validate(
             train,
             trackman,
             args.variant,
+            args.season_weight_profile,
+            args.trackman_recent_lambda,
             args.validation_pred_path,
             lgbm_device,
             catboost_device,
@@ -767,6 +898,13 @@ def main() -> None:
         if args.calibration_scale is None or args.calibration_bias is None:
             raise ValueError("--skip-validation with --lgbm-weight also requires calibration scale and bias.")
         lgbm_weight = float(args.lgbm_weight)
+        blend_weights = {
+            "lgbm": lgbm_weight,
+            "catboost": 1 - lgbm_weight,
+            "extratrees": 0.0,
+            "success": True,
+            "objective": np.nan,
+        }
         calibration = {
             "scale": float(args.calibration_scale),
             "bias": float(args.calibration_bias),
@@ -775,22 +913,33 @@ def main() -> None:
         }
         validation_metrics = {
             "provided": {
-                "lgbm_weight": lgbm_weight,
+                "blend_weights": blend_weights,
                 "calibration_scale": calibration["scale"],
                 "calibration_bias": calibration["bias"],
             }
         }
 
     print("Build final features...")
-    x_train = build_features(train, rate_priors, final_trackman_prior, final_rich_trackman_prior)
+    final_train, final_sample_weight = apply_train_variant(
+        train,
+        args.variant,
+        args.season_weight_profile,
+    )
+    final_rate_priors = make_rate_priors(final_train)
+    x_train = build_features(final_train, final_rate_priors, final_trackman_prior)
     feature_columns = list(x_train.columns)
     cat_columns = [col for col in CAT_COLS if col in feature_columns]
+    print(
+        f"Final train rows={len(final_train)} "
+        f"features={len(feature_columns)} "
+        f"sample_weight_used={final_sample_weight is not None}"
+    )
     models = fit_ensemble(
         x_train,
-        train[TARGET_COL],
+        final_train[TARGET_COL],
         feature_columns,
         cat_columns,
-        None,
+        final_sample_weight,
         lgbm_device,
         catboost_device,
         args.gpu_device,
@@ -801,18 +950,27 @@ def main() -> None:
         "models": models,
         "feature_columns": feature_columns,
         "cat_columns": cat_columns,
-        "rate_priors": rate_priors,
+        "rate_priors": final_rate_priors,
         "trackman_prior": serialize_trackman_prior(final_trackman_prior),
         "trackman_group_cols": TRACKMAN_GROUP_COLS,
-        "rich_trackman_prior": serialize_trackman_prior(final_rich_trackman_prior),
-        "rich_trackman_group_cols": RICH_TRACKMAN_GROUP_COLS,
-        "lgbm_weight": lgbm_weight,
+        "blend_weights": blend_weights,
+        "lgbm_weight": blend_weights["lgbm"],
+        "max_extratrees_weight": MAX_EXTRATREES_WEIGHT,
         "calibration": calibration,
         "validation_metrics": validation_metrics,
         "training_devices": {
             "lgbm_device": lgbm_device,
             "catboost_device": catboost_device,
+            "extratrees_device": "cpu",
             "gpu_device": args.gpu_device,
+        },
+        "recency_settings": {
+            "season_weight_profile": args.season_weight_profile,
+            "season_weight_profile_values": SEASON_WEIGHT_PROFILES[args.season_weight_profile],
+            "trackman_recent_lambda": float(args.trackman_recent_lambda),
+            "trackman_recent_season": 2024 if 2024 in set(trackman["season"]) else None,
+            "final_train_rows": int(len(final_train)),
+            "final_sample_weight_used": final_sample_weight is not None,
         },
         "target_col": TARGET_COL,
         "id_col": ID_COL,
